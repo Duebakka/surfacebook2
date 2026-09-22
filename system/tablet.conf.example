@@ -1,0 +1,65 @@
+# Surface Book 2 tablet-mode configuration
+# Location: /etc/surfacebook/tablet.conf (system) or
+#           ~/.config/surfacebook/tablet.conf (user, overrides)
+#
+# Lines are KEY=VALUE; '#' starts a comment.
+
+# Auto-rotate the display when the clipboard detaches into tablet mode.
+# 1 = rotate when the mode switch fires, 0 = never rotate (deprecated:
+# see rotation_mode).
+autorotate=1
+
+# Live rotation behavior, toggled from the widget / surfbookctl rotation.
+# auto   = follow the held orientation in tablet mode (portrait/landscape)
+# locked = freeze the current transform until switched back to auto
+rotation_mode=auto
+
+# Hyprland monitor to rotate.
+monitor=eDP-1
+
+# Transform applied in laptop mode and in tablet mode (0=normal, 1=90deg
+# clockwise, 2=180, 3=270).
+transform_laptop=0
+transform_tablet=1
+
+# Per-orientation transforms used when auto-rotating in tablet mode.
+# Calibrated on this SB2: top-up = landscape hold, right-up = book portrait.
+#   top-up    - held landscape (top edge up)   -> transforms to 0
+#   bottom-up - held 180 degrees flipped       -> 2
+#   left-up   - book portrait, rotated the other way -> 3
+#   right-up  - book portrait (natural reading) -> 1
+transform_top=0
+transform_bottom=2
+transform_left=3
+transform_right=1
+
+# Orientation sensor tuning (Surface clipboard HID accelerometer).
+# Threshold (m/s^2) above which a sensor axis counts as "down"; debounce is
+# the number of consecutive polls a new orientation must hold before applying.
+sensor_threshold=5.0
+sensor_debounce=2
+
+# Optional scale per mode (leave empty to keep the current one).
+scale_laptop=
+scale_tablet=
+
+# Watchdog poll interval in seconds.
+poll_interval=2
+
+# On-screen keyboard (wvkbd) behavior when the clipboard detaches into tablet
+# mode. Values: auto (keyboard raises while detached into tablet mode - the
+# default), on (always keep the wvkbd service running), off (never bring it
+# up automatically). Toggle at runtime with: surfbookctl keyboard
+keyboard_mode=auto
+
+# Detach-time GPU handling.
+# 0 = leave the NVIDIA device attached (driver survives the detach; the GPU
+#     pci device simply leaves the bus and the driver releases it).
+# 1 = remove the device right before the latch opens (hook detach.d/20) and
+#     rescan the bus on re-attach (attach.d/20). Full driver re-init on return.
+gpu.remove_on_detach=0
+gpu.slot=0000:01:00.0
+
+# Extra safety: kernel-inhibit touch input devices in the instants around a
+# detach (0 = off).
+touch.inhibit_on_detach=0

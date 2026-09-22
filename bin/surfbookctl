@@ -1,0 +1,482 @@
+#!/usr/bin/env bash
+# surfbookctl - Surface Book 2 command-line control.
+#
+# One entry point for the plugin's actions:
+#   status [--json]       aggregate state (daemon D-Bus props, watchdog file)
+#   eject                 software-eject the base keyboard/GPU
+#   touch on|off|toggle|status
+#                       toggle the touchscreen (Hyprland device, kernel
+#                       inhibit fallback when Hyprland knows no touch device)
+#   rotation <auto|locked|toggle|status>
+#                       rotation lock: auto-rotate to the held orientation,
+#                       or freeze the current one
+#   keyboard <auto|on|off|toggle|status>
+#                       on-screen keyboard: auto (tablet mode only),
+#                       always on, off
+#   install               install plugin config + system hooks (via pkexec)
+#   uninstall             remove plugin config + system hooks
+#   watchdog start|stop|restart|status
+#
+# Every command is safe to run from scripts; only `install`/`uninstall`
+# touch root-owned files, and they do it through pkexec when a desktop
+# session is available, falling back to sudo otherwise.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" >/dev/null 2>&1 && pwd || dirname "$(readlink -f "$0")")"
+DBUS_SERVICE="org.surface.dtx"
+DBUS_OBJECT="/org/surface/dtx"
+DBUS_IFACE="org.surface.dtx"
+
+SB_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+SB_STATE_DIR="$SB_STATE_HOME/surfacebook"
+SB_STATE_FILE="$SB_STATE_DIR/state.json"
+SB_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/surfacebook"
+SB_CONF_SAMPLE="$HERE/../system/tablet.conf.example"
+OMARCHY_TOUCH_MARKER="$HOME/.local/state/omarchy/toggles/hypr/touchscreen-disabled-name"
+KB_MODE_FILE="$SB_STATE_DIR/keyboard"
+
+# omarchy tools live in a non-PATH directory by default.
+export PATH="$HERE/bin:$HOME/.local/bin:/usr/local/bin:/usr/share/omarchy/bin:$PATH"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: surfbookctl <command> [args]
+
+Commands:
+  status [--json]             Show clipboard mode, latch, base, touch status
+  eject                       Software-eject the base (works once, reattach to restore)
+  touch <on|off|toggle|status>
+                              Toggle the touchscreen
+  rotation <auto|locked|toggle|status>
+                              Rotation lock: auto-rotate to the held
+                              orientation, or freeze the current one
+  keyboard <auto|on|off|toggle|status>
+                              On-screen keyboard: auto (tablet only),
+                              always on, off
+  install                     Install user config + system hooks (pkexec/sudo)
+  uninstall                   Remove what install did
+  watchdog <start|stop|restart|status>
+                              Manage the tablet-mode user service
+EOF
+}
+
+log() { printf '[surfacebook] %s\n' "$*"; }
+die() { printf 'surfbookctl: %s\n' "$*" >&2; exit 1; }
+
+# ---- dbus helpers ---------------------------------------------------------
+
+dbus_available() { command -v busctl >/dev/null 2>&1; }
+
+dbus_get() {
+  busctl --system get-property "$DBUS_SERVICE" "$DBUS_OBJECT" "$DBUS_IFACE" "$1" 2>/dev/null \
+    || echo ""
+}
+
+# Pull the first string out of `s "value"` or `(ssy) "a" "b" 3` output.
+dbus_first_string() {
+  # strip signature token, then quotes
+  set -- $1
+  shift
+  local s="${1:-}"
+  s="${s#\"}"; s="${s%\"}"; s="${s#\'}"; s="${s%\'}"
+  printf '%s' "$s"
+}
+
+mode() { dbus_first_string "$(dbus_get DeviceMode)"; }
+latch() { dbus_first_string "$(dbus_get LatchStatus)"; }
+base() { dbus_first_string "$(dbus_get Base)"; }
+
+dtx_ready() {
+  dbus_available || return 1
+  [[ -n $(dbus_get DeviceMode) ]]
+}
+
+# Run a command as root via the desktop polkit agent when available, else sudo.
+run_root() {
+  if command -v pkexec >/dev/null 2>&1 && pkexec --user root true 2>/dev/null; then
+    pkexec "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    die "need root privileges; no pkexec or sudo available"
+  fi
+}
+
+# ---- touch helpers --------------------------------------------------------
+
+# Touch status for a Hyprland-recognized screen: on/off/none.
+hypr_touch_status() {
+  if [[ -f $OMARCHY_TOUCH_MARKER ]]; then
+    echo "off"
+    return
+  fi
+  if command -v omarchy-hw-touchscreen >/dev/null 2>&1 && [[ -n "$(omarchy-hw-touchscreen 2>/dev/null)" ]]; then
+    echo "on"
+    return
+  fi
+  echo "none"
+}
+
+# Kernel-inhibit fallback status used when Hyprland knows no touch hardware.
+# surfbook-sys reports on/off/none from sysfs and its own marker.
+sys_touch_status() {
+  if command -v surfbook-sys >/dev/null 2>&1; then
+    surfbook-sys touch-status 2>/dev/null || echo "none"
+  else
+    echo "none"
+  fi
+}
+
+# Effective status across both mechanisms.
+touch_status() {
+  local h s
+  h="$(hypr_touch_status)"
+  if [[ $h == "none" ]]; then
+    s="$(sys_touch_status)"
+    echo "$s"
+  else
+    echo "$h"
+  fi
+}
+
+# Keep the widget's state.json fresh right after a touch toggle. The daemon can
+# be up to ~30s from its next re-publish; patch just the touch field so the
+# pill reflects the flip immediately.
+refresh_touch_state() {
+  [[ -f $SB_STATE_FILE ]] || return 0
+  local t
+  t="$(touch_status)"
+  [[ -n $t ]] || return 0
+  jq --arg t "$t" '.touch = $t' "$SB_STATE_FILE" > "$SB_STATE_FILE.tmp.$$" 2>/dev/null &&
+    mv "$SB_STATE_FILE.tmp.$$" "$SB_STATE_FILE"
+}
+
+# ---- commands -------------------------------------------------------------
+
+cmd_status() {
+  local want_json="$1"
+  local m="" la="" ba="" wo="" wu=0
+
+  if dtx_ready; then
+    m="$(mode)"
+    la="$(latch)"
+    ba="$(base)"
+  fi
+
+  local to
+  to="$(touch_status)"
+
+  if [[ -f $SB_STATE_FILE ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      wu="$(jq -r '.updated // 0' "$SB_STATE_FILE" 2>/dev/null || echo 0)"
+      [[ ${wu:-0} -gt 0 ]] && wo="true" || wo="false"
+    else
+      wo="true"
+    fi
+  fi
+
+  if [[ $want_json == "--json" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      jq -nc \
+        --arg mode "$m" --arg latch "$la" --arg base "$ba" \
+        --arg touch "$to" --arg watchdog "${wo:-false}" --argjson updated "${wu:-0}" \
+        '{mode:$mode,latch:$latch,base:$base,touch:$touch,watchdog:$watchdog,updated:$updated,desktop:0}'
+    else
+      printf '{ "mode":"%s","latch":"%s","base":"%s","touch":"%s","watchdog":%s,"updated":%s,"desktop":0 }\n' \
+        "$m" "$la" "$ba" "$to" "${wo:-false}" "${wu:-0}"
+    fi
+    return
+  fi
+
+  echo "dtx:     $([[ -n $m ]] && echo present || echo absent)"
+  echo "mode:    ${m:-unavailable}"
+  echo "latch:   ${la:-unknown}"
+  echo "base:    ${ba:-unknown}"
+  echo "touch:   $to"
+  echo "rotation:$(cmd_rotation status 2>/dev/null || echo auto)"
+  echo "keyboard:$(cmd_keyboard status 2>/dev/null || echo auto)"
+  echo "watchdog:${wo:-unknown}"
+}
+
+cmd_eject() {
+  if ! dtx_ready; then
+    die "Surface DTX daemon is not reachable (bus org.surface.dtx)"
+  fi
+
+  local ba la
+  ba="$(base)"
+  la="$(latch)"
+
+  if [[ $ba == "detached" ]]; then
+    echo "Base is already detached."
+    return 2
+  fi
+  if [[ $ba != "attached" ]]; then
+    echo "Base state is unknown (${ba:-?}); will ask the base anyway."
+  fi
+
+  local out rc
+  out="$(busctl --system call "$DBUS_SERVICE" "$DBUS_OBJECT" "$DBUS_IFACE" Request 2>&1)" || rc=$?
+  if [[ -n ${rc:-} ]]; then
+    die "Eject request failed: $out"
+  fi
+
+  echo "Ejecting base… (you can press the eject key or reattach to restore.)"
+  echo "$out"
+}
+
+cmd_rotation() {
+  local action="${1:-status}"
+  case "$action" in auto|locked|toggle|status) ;; *) usage; die "bad rotation action: $action" ;; esac
+
+  local current=auto
+  if [[ -f $SB_STATE_DIR/rotation ]]; then
+    local v
+    v="$(cat "$SB_STATE_DIR/rotation" 2>/dev/null || true)"
+    [[ $v == auto || $v == locked ]] && current="$v"
+  fi
+
+  if [[ $action == "status" ]]; then
+    echo "$current"
+    return
+  fi
+
+  if [[ $action == "toggle" ]]; then
+    action="$([[ $current == auto ]] && echo locked || echo auto)"
+  fi
+
+  mkdir -p "$SB_STATE_DIR"
+  printf '%s\n' "$action" > "$SB_STATE_DIR/rotation.tmp" && mv "$SB_STATE_DIR/rotation.tmp" "$SB_STATE_DIR/rotation"
+  # Restart the watchdog so surfbookd applies the new mode (and re-reads the
+  # current edge) without waiting a full poll cycle.
+  systemctl --user restart surfacebook-watchdog.service 2>/dev/null || true
+  echo "Rotation mode: $action"
+}
+
+cmd_keyboard() {
+  local action="${1:-status}"
+  case "$action" in auto|on|off|toggle|status) ;; *) usage; die "bad keyboard action: $action" ;; esac
+
+  # Status reflects the intended on/off state (the QML overlay implements it).
+  if [[ $action == "status" ]]; then
+    if [[ -f $SB_STATE_FILE ]]; then
+      local kb
+      kb="$(jq -r '.keyboard_status // "off"' "$SB_STATE_FILE" 2>/dev/null || echo off)"
+      echo "$kb"
+      return
+    fi
+    local m ba
+    [[ -n $(dbus_get DeviceMode) ]] && { m="$(mode)"; ba="$(base)"; }
+    if [[ -n $m ]]; then
+      local want=auto
+      [[ -f $KB_MODE_FILE ]] && want="$(cat "$KB_MODE_FILE" 2>/dev/null || echo auto)"
+      [[ $want == auto ]] && want="$([[ $m == tablet && $ba == detached ]] && echo on || echo off)"
+      echo "$want"
+    else
+      echo off
+    fi
+    return
+  fi
+
+  if [[ $action == "toggle" ]]; then
+    # Flip the manual intent the same way rotation toggle does: if the
+    # keyboard is currently forced on (manual "on"/"off" intent), clear it
+    # back to the tablet-only default; otherwise flip between auto and off.
+    local mode="auto"
+    [[ -f $KB_MODE_FILE ]] && mode="$(cat "$KB_MODE_FILE" 2>/dev/null || echo auto)"
+    case "$mode" in
+      off) action=auto ;;
+      on)  action=auto ;;
+      auto) action=off ;;
+    esac
+  fi
+
+  # Manual intent is recorded so surfbookd keeps it across the auto/off
+  # transitions it drives; "<auto>" restores the tablet-only behavior.
+  if [[ $action == auto ]]; then
+    rm -f "$KB_MODE_FILE"
+  else
+    mkdir -p "$SB_STATE_DIR"
+    printf '%s\n' "$action" > "$KB_MODE_FILE"
+  fi
+
+  # Restart the watchdog so surfbookd republishes the new keyboard intent to
+  # state.json; the QML overlay reacts to keyboard_status.
+  systemctl --user restart surfacebook-watchdog.service 2>/dev/null || true
+  echo "On-screen keyboard: $action"
+}
+
+cmd_touch() {
+  local action="${1:-toggle}"
+  case "$action" in on|off|toggle|status) ;; *) usage; die "bad touch action: $action" ;; esac
+
+  if [[ $action == "status" ]]; then
+    echo "$(touch_status)"
+    return
+  fi
+
+  # A detached clipboard has no physical keyboard, so the on-screen keyboard is
+  # the only way to type. Refuse to take touch away while the base is detached.
+  local want
+  want="$action"
+  if [[ $action == toggle ]]; then
+    want="$([[ $(touch_status) == off ]] && echo on || echo off)"
+  fi
+      if [[ $want == off && $(base) == detached ]]; then
+        echo "Cannot disable the touchscreen while the base is detached (no physical keyboard)." >&2
+        return 2
+      fi
+
+  # Preferred path: Hyprland-native device toggle with OSD + persistence.
+  if command -v omarchy-toggle-input-device >/dev/null 2>&1; then
+    local out rc
+    out="$(omarchy-toggle-input-device touchscreen "$action" 2>&1)" || rc=$?
+    if [[ -z ${rc:-} ]]; then
+      refresh_touch_state
+      echo "Touchscreen toggled: $(touch_status)"
+      return
+    fi
+    if [[ "$out" == *"No touchscreen device found"* ]]; then
+      # Fall back to kernel inhibit (covers IPTS digitizers Hyprland
+      # does not know, plus the momentary gap before iptsd exposes one).
+      if [[ $(sys_touch_status) == none ]]; then
+        echo "No touchscreen detected on this clipboard." >&2
+        return 2
+      fi
+      if ! command -v surfbook-sys >/dev/null 2>&1; then
+        die "Hyprland knows no touchscreen and surfbook-sys is missing (run: surfbookctl install)"
+      fi
+      local want=noop
+      [[ $action == "toggle" ]] && want="$([[ $(touch_status) == off ]] && echo on || echo off)"
+      [[ $action != "toggle" ]] && want="$action"
+      # Kernel-inhibit the digitizer (Hyprland knows nothing of it); needs root.
+      run_root "$(command -v surfbook-sys)" inhibit "$want"
+      refresh_touch_state
+      echo "Touchscreen toggled via kernel inhibit: $(surfbook-sys touch-status)"
+      return
+    fi
+    die "$out"
+  fi
+
+  die "omarchy-toggle-input-device not found on PATH"
+}
+
+_cmd_install_system() {
+  # Escalate for the root-owned hooks; surfbook-sys installs itself with
+  # install-root when invoked this way (surfbookctl has no other root entry).
+  local bin
+  bin="$(command -v surfbook-sys || ([[ -x $HERE/surfbook-sys ]] && echo "$HERE/surfbook-sys") || echo /usr/local/lib/surfacebook/bin/surfbook-sys)"
+  if [[ -x $bin ]]; then
+    # Pass the repo root so install-root picks up system/hooks + unit + sample
+    # even when surfbook-sys runs from an installed copy.
+    run_root "$bin" install-root "$(dirname "$HERE")" || die "system install failed"
+  else
+    die "surfbook-sys not found; run install-root from the repo first"
+  fi
+}
+
+cmd_install() {
+  # 1. Plugin files -> user config (id matches manifest.json).
+  local plugin_dst="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/dues.surfacebook2"
+  local src_dir
+  src_dir="$(dirname "$HERE")"
+
+  if [[ $src_dir != "$plugin_dst" ]]; then
+    mkdir -p "$plugin_dst"
+    cp -a "$src_dir/BarWidget.qml" "$src_dir/Panel.qml" "$src_dir/Model.js" \
+          "$src_dir/Keyboard.qml" "$src_dir/KeyboardKey.qml" "$src_dir/KeyboardLayout.js" \
+          "$src_dir/manifest.json" "$src_dir/bin" "$plugin_dst"/
+    log "plugin files installed to $plugin_dst"
+  fi
+
+  # 2. User config sample.
+  if [[ ! -f "$SB_CONF_DIR/tablet.conf" ]]; then
+    mkdir -p "$SB_CONF_DIR"
+    cp "$SB_CONF_SAMPLE" "$SB_CONF_DIR/tablet.conf"
+    log "wrote $SB_CONF_DIR/tablet.conf"
+  fi
+
+  # 3. Root hooks (dtx wrappers, router, unit, GPU hooks).
+  _cmd_install_system
+
+  # 4. User units: also place copies under ~/.config/systemd/user so the user
+  #    manager reliably finds them (the /usr/local/lib path is not always in
+  #    the runtime search path of desktop sessions).
+  local unit_src=/usr/local/lib/systemd/user/surfacebook-watchdog.service
+  if [[ -f $unit_src ]]; then
+    mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    cp "$unit_src" "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/surfacebook-watchdog.service"
+    log "user unit at ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/surfacebook-watchdog.service"
+  fi
+  local kb_unit_src=/usr/local/lib/systemd/user/surfacebook-ydotoold.service
+  if [[ -f $kb_unit_src ]]; then
+    mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    cp "$kb_unit_src" "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/surfacebook-ydotoold.service"
+    log "user unit at ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/surfacebook-ydotoold.service"
+  fi
+
+  # 5. Start the tablet-mode watchdog + ydotool daemon (and persist for login).
+  cmd_watchdog restart
+  systemctl --user enable --quiet surfacebook-watchdog.service 2>/dev/null || true
+  systemctl --user daemon-reload 2>/dev/null || true
+  systemctl --user enable --now surfacebook-ydotoold.service 2>/dev/null \
+    && log "ydotoold started" \
+    || log "warning: ydotool check finished (daemon: $(systemctl --user is-active surfacebook-ydotoold.service 2>/dev/null || echo unknown))"
+
+  echo
+  echo "Done. Quickshell will hot-reload the new bar widget; if it is not on"
+  echo "your bar yet, add it in Settings > Bar & Popups > Widgets."
+  echo "Fetch state with: surfbookctl status"
+}
+
+cmd_uninstall() {
+  local plugin_dst="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/dues.surfacebook2"
+  local bin
+  bin="$(command -v surfbook-sys || echo /usr/local/lib/surfacebook/surfbook-sys)"
+
+  cmd_watchdog stop || true
+
+  if [[ -x $bin ]]; then
+    if command -v pkexec >/dev/null 2>&1 && pkexec --user root true 2>/dev/null; then
+      pkexec "$bin" uninstall-root || true
+    elif command -v sudo >/dev/null 2>&1; then
+      sudo "$bin" uninstall-root || true
+    fi
+  fi
+
+  if [[ -d $plugin_dst ]]; then
+    rm -rf "$plugin_dst"
+    log "removed plugin $plugin_dst"
+  fi
+  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/surfacebook-keyboard.service"
+  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/surfacebook-ydotoold.service"
+  systemctl --user disable --now surfacebook-ydotoold.service 2>/dev/null || true
+  log "user config left in place: $SB_CONF_DIR/tablet.conf"
+}
+
+cmd_watchdog() {
+  local action="${1:-status}"
+  case "$action" in start|stop|restart|status) ;; *) usage; die "bad watchdog action: $action" ;; esac
+
+  if [[ ! -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/surfacebook-watchdog.service" \
+        && ! -f /usr/local/lib/systemd/user/surfacebook-watchdog.service ]]; then
+    die "surfacebook-watchdog.service not installed (run: surfbookctl install)"
+  fi
+
+  systemctl --user daemon-reload
+  systemctl --user "$action" surfacebook-watchdog.service
+}
+
+# ---- dispatch -------------------------------------------------------------
+
+case "${1:-}" in
+  status)   cmd_status "${2:-}" ;;
+  eject)    cmd_eject ;;
+  touch)    shift; cmd_touch "${1:-toggle}" ;;
+  rotation) shift; cmd_rotation "${1:-status}" ;;
+  keyboard) shift; cmd_keyboard "${1:-status}" ;;
+  install)  cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  watchdog) shift; cmd_watchdog "${1:-status}" ;;
+  *) usage; exit 1 ;;
+esac

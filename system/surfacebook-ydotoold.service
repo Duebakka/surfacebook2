@@ -1,0 +1,17 @@
+[Unit]
+Description=Surface Book 2 ydotool daemon (uinput injection for the on-screen keyboard)
+Documentation=https://github.com/duebakka/surfacebook2
+# The plugin's split on-screen keyboard injects keystrokes through ydotool,
+# which needs this daemon holding /dev/uinput. Runs inside the graphical
+# session so logind's uaccess ACL on /dev/uinput applies.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ydotoold
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

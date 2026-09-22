@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# surfbookd - Surface Book 2 tablet-mode watchdog (user service, no root).
+#
+# Polls org.surface.dtx on the system bus and mirrors the clipboard state to
+# $XDG_STATE_HOME/surfacebook/state.json for the bar widget. When the mode
+# flips to "tablet" (clipboard detached + swivelled), the internal display is
+# rotated to follow how the clipboard is held (read from the on-board HID
+# accelerometer): portrait when held upright, landscape when held sideways.
+# Rotating back to laptop mode rotates home. A rotation lock (surfbookctl
+# rotation locked) freezes the transform until unlocked. In tablet mode the
+# plugin's on-screen keyboard overlay is made visible (state.json
+# keyboard_status; the overlay injects keystrokes itself via ydotool).
+# surfbookctl keyboard on/off overrides the automatic behavior.
+#
+# Run via surfacebook-watchdog.service (or from a terminal: surfbookd run).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" >/dev/null 2>&1 && pwd || dirname "$(readlink -f "$0")")"
+export PATH="$HERE:$HOME/.local/bin:/usr/local/bin:/usr/share/omarchy/bin:$PATH"
+
+DBUS_SERVICE="org.surface.dtx"
+DBUS_OBJECT="/org/surface/dtx"
+DBUS_IFACE="org.surface.dtx"
+
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+STATE_DIR="$STATE_HOME/surfacebook"
+STATE_FILE="$STATE_DIR/state.json"
+ROT_MODE_FILE="$STATE_DIR/rotation"
+LOCK_FILE="$STATE_DIR/watchdog.lock"
+LOG_FILE="${SB_LOG_FILE:-$STATE_DIR/watchdog.log}"
+
+USER_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/surfacebook/tablet.conf"
+SYS_CONF="/etc/surfacebook/tablet.conf"
+OMARCHY_TOUCH_MARKER="$HOME/.local/state/omarchy/toggles/hypr/touchscreen-disabled-name"
+KB_MODE_FILE="$STATE_DIR/keyboard"
+
+# ---- config ---------------------------------------------------------------
+
+# last-wins over system then user file; KEY=VALUE, '#' comments, no spaces
+declare -A CFG=(
+  [rotation_mode]=auto
+  [monitor]=eDP-1
+  [transform_laptop]=0
+  [transform_tablet]=1
+  [transform_top]=0
+  [transform_bottom]=2
+  [transform_left]=3
+  [transform_right]=1
+  [scale_laptop]=
+  [scale_tablet]=
+  [sensor_threshold]=5.0
+  [sensor_debounce]=2
+  [poll_interval]=2
+  [keyboard_mode]=auto
+)
+
+load_config() {
+  local f line key val
+  for f in "$SYS_CONF" "$USER_CONF"; do
+    [[ -f $f ]] || continue
+    while IFS= read -r line; do
+      line="${line%%#*}"
+      [[ -z $line ]] && continue
+      key="${line%%=*}"; val="${line#*=}"
+      key="$(echo "$key" | tr -d '[:space:]')"
+      val="$(echo "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [[ -z $key ]] && continue
+      CFG["$key"]="$val"
+    done < "$f"
+  done
+  # Legacy knob: autorotate=0 disables automatic rotation entirely.
+  if [[ -z ${CFG[rotation_mode]:-} && ${CFG[autorotate]:-1} -eq 0 ]]; then
+    CFG[rotation_mode]=locked
+  fi
+}
+
+cfg() { echo "${CFG[$1]:-}"; }
+
+# ---- dbus ----------------------------------------------------------------
+
+dbus_get() {
+  busctl --system get-property "$DBUS_SERVICE" "$DBUS_OBJECT" "$DBUS_IFACE" "$1" 2>/dev/null \
+    || echo ""
+}
+
+first_string() {
+  set -- $1
+  shift
+  local s="${1:-}"
+  s="${s#\"}"; s="${s%\"}"; s="${s#\'}"; s="${s%\'}"
+  printf '%s' "$s"
+}
+
+mode() { first_string "$(dbus_get DeviceMode)"; }
+latch() { first_string "$(dbus_get LatchStatus)"; }
+base() { first_string "$(dbus_get Base)"; }
+
+# ---- touch status (mirrors surfbookctl; kept here so state.json is fresh) --
+
+touch_status() {
+  local h s
+  if [[ -f $OMARCHY_TOUCH_MARKER ]]; then
+    echo "off"; return
+  fi
+  if command -v omarchy-hw-touchscreen >/dev/null 2>&1 \
+     && [[ -n "$(omarchy-hw-touchscreen 2>/dev/null)" ]]; then
+    echo "on"; return
+  fi
+  s="$(command -v surfbook-sys >/dev/null 2>&1 && surfbook-sys touch-status 2>/dev/null || echo none)"
+  echo "$s"
+}
+
+# ---- rotation mode --------------------------------------------------------
+
+# Runtime lock lives in $STATE_DIR/rotation ("auto"|"locked"), written by
+# surfbookctl rotation; absent runtime file falls back to config, which
+# honours the legacy autorotate knob.
+rotation_mode() {
+  if [[ -f $ROT_MODE_FILE ]]; then
+    local v
+    v="$(cat "$ROT_MODE_FILE" 2>/dev/null || true)"
+    [[ $v == locked || $v == auto ]] && { echo "$v"; return; }
+  fi
+  [[ $(cfg rotation_mode) == locked ]] && { echo locked; return; }
+  echo auto
+}
+
+# ---- on-screen keyboard -----------------------------------------------------
+
+# Runtime intent lives in $STATE_DIR/keyboard ("auto"|"on"|"off"), written by
+# surfbookctl keyboard; absent runtime file falls back to config keyboard_mode:
+#   auto - follow tablet mode: raise the keyboard only while detached
+#   on   - always keep the keyboard running
+#   off  - never bring it up automatically
+keyboard_mode() {
+  if [[ -f $KB_MODE_FILE ]]; then
+    local v
+    v="$(cat "$KB_MODE_FILE" 2>/dev/null || true)"
+    [[ $v == on || $v == off || $v == auto ]] && { echo "$v"; return; }
+  fi
+  [[ $(cfg keyboard_mode) == off ]] && { echo off; return; }
+  echo auto
+}
+
+# Effective on/off of the on-screen keyboard, for the QML overlay. It reports
+# what the keyboard *should* do now (based on the intent + current mode/base),
+# not a service state — the overlay itself reads this and injects via ydotool.
+keyboard_status() {
+  local m="$1" ba="$2" want run=off
+  want="$(keyboard_mode)"
+  if [[ $want == on ]]; then
+    run=on
+  elif [[ $want == auto ]]; then
+    if [[ $m == tablet && $ba == detached ]]; then
+      run=on
+    fi
+  fi
+  echo "$run"
+}
+
+# ---- orientation sensor ---------------------------------------------------
+
+# The clipboard exposes a HID sensor hub with an accel_3d IIO device
+# (iio:device1 here). The accelerometer measures a stationary specific force
+# along -gravity, so a gravity vector points "down": strong -Y means the top
+# of the screen is up, strong +X means the left edge is up, and so on.
+SENSOR_DIR=""
+
+sensor_dir() {
+  [[ -n $SENSOR_DIR ]] && { echo "$SENSOR_DIR"; return 0; }
+  local d name
+  for d in /sys/bus/iio/devices/iio:device*; do
+    [[ -f $d/name ]] || continue
+    name="$(cat "$d/name" 2>/dev/null)"
+    if [[ $name == accel_3d && -f $d/in_accel_x_raw && -f $d/in_accel_y_raw ]]; then
+      SENSOR_DIR="$d"; echo "$d"
+      return 0
+    fi
+  done
+  echo ""
+  return 1
+}
+
+# Print "x y" gravity components in m/s² (empty when no sensor).
+sensor_g() {
+  local d
+  d="$(sensor_dir)" || return 1
+  [[ -n $d ]] || return 1
+  local x y s
+  x="$(cat "$d/in_accel_x_raw" 2>/dev/null || true)"
+  y="$(cat "$d/in_accel_y_raw" 2>/dev/null || true)"
+  s="$(cat "$d/in_accel_scale" 2>/dev/null || true)"
+  [[ -n $x && -n $y && -n $s ]] || return 1
+  awk -v x="$x" -v y="$y" -v s="$s" 'BEGIN { printf "%.3f %.3f", x * s, y * s }'
+}
+
+absf() { awk -v v="$1" 'BEGIN { printf "%.4f", (v < 0 ? -v : v) }'; }
+
+gtf() { awk -v a="$1" -v b="$2" 'BEGIN { printf (a > b) ? "1" : "0" }'; }
+
+# Climbed edge of the screen, from gravity: one of top-up, bottom-up, left-up,
+# right-up, or flat (held near-level / no sensor) — empty means unavailable.
+edge() {
+  local g x y
+  g="$(sensor_g)" || { echo ""; return 1; }
+  [[ -n $g ]] || { echo ""; return 1; }
+  set -- $g
+  x="$1"; y="$2"
+
+  local T ax ay
+  T="$(cfg sensor_threshold)"
+  T=$(awk -v t="$T" 'BEGIN { if (t==t+0 && t>0 && t<=20) print t; else print 5 }')
+  ax="$(absf "$x")"; ay="$(absf "$y")"
+
+  # Only commit when a single axis clearly carries gravity: near-level
+  # readings (dominant axis below threshold) are "flat" and must not rotate.
+  if [[ $(gtf "$ax" "$ay") == 1 ]]; then
+    [[ $(gtf "$ax" "$T") == 1 ]] || { echo "flat"; return 0; }
+    echo "$(awk -v v="$x" 'BEGIN { print (v > 0 ? "right-up" : "left-up") }')"
+    return 0
+  fi
+  [[ $(gtf "$ay" "$T") != 1 ]] && { echo "flat"; return 0; }
+  echo "$(awk -v v="$y" 'BEGIN { print (v < 0 ? "top-up" : "bottom-up") }')"
+  return 0
+}
+
+transform_for_edge() {
+  case "$1" in
+    top-up)    cfg transform_top ;;
+    bottom-up) cfg transform_bottom ;;
+    left-up)   cfg transform_left ;;
+    right-up)  cfg transform_right ;;
+    *)         cfg transform_tablet ;;  # flat / unknown: legacy portrait
+  esac
+}
+
+# ---- rotation -------------------------------------------------------------
+
+sanitize_monitor() {
+  local m="$1"
+  m="${m//[^A-Za-z0-9_.:-]/}"
+  echo "$m"
+}
+
+current_transform() {
+  command -v hyprctl >/dev/null 2>&1 || return 1
+  hyprctl -j monitors 2>/dev/null | jq -er --arg m "$(sanitize_monitor "$(cfg monitor)")" \
+    'map(select(.name==$m))[0].transform // 1' 2>/dev/null || echo ""
+}
+
+# rotate <mode> [explicit transform]. mode is laptop|tablet; the transform is
+# `transform_laptop`/`transform_tablet` for the mode, or the explicit one
+# (used for edge autotrotation).
+rotate() {
+  local want="$1" tr scale
+  if [[ $want == laptop ]]; then
+    tr="$(cfg transform_laptop)"; scale="$(cfg scale_laptop)"
+  else
+    tr="${2:-$(cfg transform_tablet)}"; scale="$(cfg scale_tablet)"
+  fi
+  tr="$(echo "$tr" | tr -cd '0-9')"
+  [[ -z $tr ]] && return 0
+  scale="$(echo "$scale" | tr -cd '0-9.')"
+  [[ -z $scale ]] && scale="auto"
+
+  # Hyprland 0.5x partially ignores hl.monitor({output, transform}) - it needs
+  # the full monitor rule (mode/position/scale included) before a runtime
+  # transform change lands. Verify and re-apply once if the update was dropped.
+  local spec="output = \"$(sanitize_monitor "$(cfg monitor)")\", mode = \"preferred\", position = \"auto\", scale = \"$scale\", transform = $tr"
+  if command -v hyprctl >/dev/null 2>&1; then
+    hyprctl eval "hl.monitor({ $spec })" >/dev/null 2>&1 || true
+    sleep 0.4
+    if [[ "$(current_transform)" != "$tr" ]]; then
+      hyprctl eval "hl.monitor({ $spec })" >/dev/null 2>&1 || true
+      sleep 0.4
+    fi
+  fi
+  log "rotated ${want} -> transform $tr${scale:+ scale $scale}"
+}
+
+# ---- state file -----------------------------------------------------------
+
+write_state() {
+  local m ba la desk up ro ori tr kb kbs
+  m="${1:-unknown}"; la="${2:-unknown}"; ba="${3:-unknown}"; desk="$4"
+  up="$(date +%s)"
+  ro="$(rotation_mode)"
+  ori="$(edge)"
+  tr="$(current_transform)"
+  kb="$(keyboard_mode)"
+  kbs="$(keyboard_status "$m" "$ba")"
+  mkdir -p "$STATE_DIR"
+  if command -v jq >/dev/null 2>&1; then
+    jq -nc --arg m "$m" --arg la "$la" --arg ba "$ba" --argjson desk "$desk" \
+      --arg t "$(touch_status)" --arg ro "$ro" --arg ori "$ori" --arg tr "$tr" \
+      --arg kb "$kb" --arg kbs "$kbs" --argjson up "$up" \
+      '{mode:$m,latch:$la,base:$ba,desktop:$desk,touch:$t,rotation:$ro,orientation:$ori,transform:$tr,keyboard:$kb,keyboard_status:$kbs,watchdog:true,updated:$up}' \
+      > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  else
+    printf '{"mode":"%s","latch":"%s","base":"%s","desktop":%s,"touch":"%s","rotation":"%s","orientation":"%s","transform":%s,"keyboard":"%s","keyboard_status":"%s","watchdog":true,"updated":%s}\n' \
+      "$m" "$la" "$ba" "$desk" "$(touch_status)" "$ro" "$ori" "${tr:-null}" "$kb" "$kbs" "$up" > "$STATE_FILE"
+  fi
+}
+
+# ---- main loop ------------------------------------------------------------
+
+LANG=C
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
+
+single_instance() {
+  mkdir -p "$STATE_DIR"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || { log "another surfbookd holds the lock"; exit 0; }
+  fi
+}
+
+apply_policy_once() {
+  # Called on state change. Laptop/studio rotate home regardless of the
+  # rotation lock (attaching the base is a mode change, not a grip change);
+  # entering tablet rotates to the current edge automatically unless locked.
+  # Desktop entries never rotate.
+  local m ba desk="${3:-0}"
+  m="$1"; ba="$2"
+
+  if [[ $desk -eq 1 ]]; then
+    return 0
+  fi
+  if [[ $m == laptop || $m == studio ]]; then
+    rotate laptop
+    return 0
+  fi
+  if [[ $m == tablet && $ba == detached && $(rotation_mode) == auto ]]; then
+    rotate tablet "$(transform_for_edge "$(edge)")"
+  fi
+}
+
+run() {
+  single_instance
+  load_config
+  local sleep_sec="$(cfg poll_interval)"
+  sleep_sec="$(echo "$sleep_sec" | tr -cd '0-9')"
+  [[ -n $sleep_sec && $sleep_sec -ge 1 && $sleep_sec -le 30 ]] || sleep_sec=2
+  local debounce="$(cfg sensor_debounce)"
+  debounce="$(echo "$debounce" | tr -cd '0-9')"
+  [[ -n $debounce && $debounce -ge 1 && $debounce -le 10 ]] || debounce=2
+  log "surfbookd starting (poll ${sleep_sec}s, sensor debounce ${debounce}x)"
+  write_state unknown unknown unknown 0
+
+  local prev_m="" prev_ba="" prev_desk=0
+  local prev_edge="" pending_edge="" applied_edge=""
+  local confirm=0
+  local idle=0
+
+  while :; do
+    local m ba la
+    if busctl --system list 2>/dev/null | grep -q "$DBUS_SERVICE"; then
+      m="$(mode)"; ba="$(base)"; la="$(latch)"
+    else
+      m="unknown"; ba="unknown"; la="unknown"
+    fi
+
+    # desktop=True surfaces (lock screen, other pre-lockscreen) skip rotation,
+    # mirroring omarchy's clamshell helper.
+    local desk=0
+    if command -v hyprctl >/dev/null 2>&1 && [[ -n "$(hyprctl -j activewindow 2>/dev/null | jq -r 'select(.class=="desktop") | .class' 2>/dev/null)" ]]; then
+      desk=1
+    fi
+
+    if [[ $m != "$prev_m" || $ba != "$prev_ba" || $desk != "$prev_desk" ]]; then
+      apply_policy_once "$m" "$ba" "$desk"
+      write_state "$m" "$la" "$ba" "$desk"
+      prev_m="$m"; prev_ba="$ba"; prev_desk="$desk"
+
+      # Reset the grip tracker on mode changes to land the first edge read
+      # immediately (entry state rotates once, later changes debounce).
+      prev_edge="$(edge)"; pending_edge="$prev_edge"
+      applied_edge="$prev_edge"
+      confirm=0
+      idle=0
+    fi
+
+    # In tablet (auto) mode, keep chasing the held orientation with a small
+    # debounce so grip wobble doesn't flip the screen back and forth.
+    if [[ $m == tablet && $ba == detached && $(rotation_mode) == auto ]]; then
+      local e
+      e="$(edge)"
+      if [[ -n $e && $e != flat ]]; then
+        if [[ $e != "$prev_edge" ]]; then
+          prev_edge="$e"; pending_edge="$e"; confirm=1
+        elif [[ $confirm -lt $debounce ]]; then
+          confirm=$((confirm + 1))
+        fi
+        if [[ $confirm -ge $debounce && $pending_edge != "$applied_edge" ]]; then
+          rotate tablet "$(transform_for_edge "$pending_edge")"
+          applied_edge="$pending_edge"
+          write_state "$m" "$la" "$ba" "$desk"
+        fi
+      fi
+    elif [[ $m != "unknown" ]]; then
+      prev_edge=""; pending_edge=""; applied_edge=""; confirm=0
+    fi
+
+    sleep "$sleep_sec"
+    idle=$((idle + 1))
+    # Re-publish every ~30s so the widget stays honest across restarts.
+    if [[ $idle -ge $((30 / sleep_sec)) ]]; then
+      write_state "$m" "$la" "$ba" "$desk"
+      idle=0
+    fi
+  done
+}
+
+[[ ${1:-run} == run ]] || { echo "usage: surfbookd [run]" >&2; exit 1; }
+run

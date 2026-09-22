@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# surfbook-sys - Surface Book 2 tooling with root-unprivileged split.
+#
+# Root-only commands run via pkexec/sudo (see surfbookctl):
+#   install-root [SRCROOT]      install router + hooks + dtx wrappers + unit
+#   uninstall-root              reverse install-root
+#   inhibit on|off              kernel-inhibit direct-input (touch) devices
+#   gpu prepare|resume          optional NVIDIA PCI remove/rescan
+#
+# Any-user commands (read-only sysfs/DBus lookups):
+#   touch-status                on|off|none, from kernel input sysfs
+#   hwtab-check                 print "ok" if a Surface DTX is present, else ""
+set -euo pipefail
+
+SELF_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." >/dev/null 2>&1 && pwd)"
+LIB_DIR="/usr/local/lib/surfacebook"
+HOOKS_DIR="$LIB_DIR/system/hooks"
+BIN_DIR="$LIB_DIR/bin"
+DTX_DIR="/etc/surface-dtx"
+CONF_MARK="generated-by-surfacebook2"
+DAEMON_CONF="$DTX_DIR/surface-dtx-daemon.conf"
+DAEMON_CONF_BAK="$DAEMON_CONF.pkg-orig"
+ROUTER="$HOOKS_DIR/router.sh"
+
+log() { printf '[surfbook-sys] %s\n' "$*"; }
+
+require_root() {
+  [ "$(id -u)" -eq 0 ] || { echo "surfbook-sys: '$1' must run as root" >&2; exit 1; }
+}
+
+# ---- dtx wrapper management ------------------------------------------------
+
+install_dtx_wrappers() {
+  mkdir -p "$DTX_DIR"
+
+  # Keep whatever the package shipped around, both for restoring on uninstall
+  # and so detach.d/00-stock.sh can still run the stock detach behavior.
+  if [[ -f $DTX_DIR/detach.sh && ! -e $DTX_DIR/detach.sh.dist ]]; then
+    cp -a "$DTX_DIR/detach.sh" "$DTX_DIR/detach.sh.dist"
+  fi
+  if [[ -f $DTX_DIR/attach.sh && ! -e $DTX_DIR/attach.sh.dist ]]; then
+    cp -a "$DTX_DIR/attach.sh" "$DTX_DIR/attach.sh.dist"
+  fi
+
+  local event
+  for event in detach detach_abort attach; do
+    cat > "$DTX_DIR/$event.sh" <<EOF
+#!/usr/bin/env sh
+# $CONF_MARK - do not edit; regenerate with surfbookctl install.
+exec "$ROUTER" $event "\$@"
+EOF
+    chmod 755 "$DTX_DIR/$event.sh"
+  done
+
+  # Point detach_abort at its own wrapper (the stock conf reuses attach.sh).
+  # In-place sed: `exec =` under [handler.detach_abort] only. TOML rejects
+  # duplicate tables, so appending an override block is not an option.
+  if [[ -f $DAEMON_CONF ]]; then
+    [[ -e $DAEMON_CONF_BAK ]] || cp -a "$DAEMON_CONF" "$DAEMON_CONF_BAK"
+    # Repair any duplicate-table bloat an older version of this installer left.
+    if [[ $(grep -c '^\s*\[handler\.detach_abort\]' "$DAEMON_CONF") -gt 1 && -e $DAEMON_CONF_BAK ]]; then
+      cp -a "$DAEMON_CONF_BAK" "$DAEMON_CONF"
+    fi
+    if ! grep -q "detach_abort.sh" "$DAEMON_CONF"; then
+      sed -i '/^\[handler\.detach_abort\]/,/^\[/ s|^[[:space:]]*exec[[:space:]]*=.*|exec = "./detach_abort.sh"|' "$DAEMON_CONF"
+    fi
+  fi
+}
+
+restore_dtx_wrappers() {
+  rm -f "$DTX_DIR/detach.sh" "$DTX_DIR/attach.sh" "$DTX_DIR/detach_abort.sh"
+  [[ -f $DTX_DIR/detach.sh.dist ]] && mv -f "$DTX_DIR/detach.sh.dist" "$DTX_DIR/detach.sh"
+  [[ -f $DTX_DIR/attach.sh.dist ]] && mv -f "$DTX_DIR/attach.sh.dist" "$DTX_DIR/attach.sh"
+  if [[ -f $DAEMON_CONF_BAK ]]; then
+    cp -a "$DAEMON_CONF_BAK" "$DAEMON_CONF"
+  fi
+}
+
+# ---- install / uninstall ---------------------------------------------------
+
+install_root() {
+  local src="${1:-}"
+  if [[ -z $src ]]; then
+    # Running from the repo clone: surfbook-sys lives at <repo>/bin/.
+    local probe="$SELF_ROOT/bin/surfbook-sys"
+    [[ -f $probe ]] && src="$SELF_ROOT"
+  fi
+  if [[ -z $src || ! -f $src/system/hooks/router.sh ]]; then
+    # Re-install from an already-installed tree (self refresh).
+    if [[ -f $LIB_DIR/system/hooks/router.sh ]]; then
+      src="$LIB_DIR"
+    else
+      echo "surfbook-sys install-root: missing source tree (pass the repo root)" >&2
+      exit 1
+    fi
+  fi
+
+  mkdir -p "$BIN_DIR" "$LIB_DIR/system" "$HOOKS_DIR/detach.d" "$HOOKS_DIR/attach.d" /usr/local/lib/systemd/user
+  rm -f /usr/local/lib/systemd/user/surfacebook-tablet.service
+  cp -a "$src/bin/surfbookctl" "$src/bin/surfbookd" "$src/bin/surfbook-sys" "$BIN_DIR/"
+  cp -a "$src/system/." "$LIB_DIR/system/"
+  chmod -R 755 "$BIN_DIR" "$HOOKS_DIR"
+  cp "$LIB_DIR/system/surfacebook-watchdog.service" /usr/local/lib/systemd/user/
+  cp "$LIB_DIR/system/surfacebook-ydotoold.service" /usr/local/lib/systemd/user/
+
+  [[ -f /etc/surfacebook/tablet.conf ]] || {
+    mkdir -p /etc/surfacebook
+    cp "$LIB_DIR/system/tablet.conf.example" /etc/surfacebook/tablet.conf
+    chmod 644 /etc/surfacebook/tablet.conf
+    log "wrote /etc/surfacebook/tablet.conf from example"
+  }
+
+  ln -sf "$BIN_DIR/surfbookctl" /usr/local/bin/surfbookctl
+  ln -sf "$BIN_DIR/surfbookd" /usr/local/bin/surfbookd
+  ln -sf "$BIN_DIR/surfbook-sys" /usr/local/bin/surfbook-sys
+
+  install_dtx_wrappers
+
+  systemctl restart surface-dtx-daemon.service || log "warning: could not restart surface-dtx-daemon"
+  log "installed. Hooks: $HOOKS_DIR  Wrappers: $DTX_DIR/{detach,detach_abort,attach}.sh"
+}
+
+uninstall_root() {
+  restore_dtx_wrappers
+  systemctl restart surface-dtx-daemon.service || true
+
+  rm -f /usr/local/bin/surfbookctl /usr/local/bin/surfbookd /usr/local/bin/surfbook-sys
+  rm -f /usr/local/lib/systemd/user/surfacebook-watchdog.service
+  rm -f /usr/local/lib/systemd/user/surfacebook-keyboard.service
+  rm -f /usr/local/lib/systemd/user/surfacebook-ydotoold.service
+  rm -rf "$LIB_DIR"
+  log "removed $LIB_DIR, wrappers, unit; kept /etc/surfacebook/tablet.conf"
+}
+
+# ---- touch sysfs -----------------------------------------------------------
+
+# Direct-input devices (INPUT_PROP_DIRECT = properties bit 1).
+touch_devices() {
+  local p v
+  for p in /sys/class/input/input*; do
+    [[ -e $p/properties ]] || continue
+    v="$(< "$p/properties")"
+    v=$(( v & 2 )) 2>/dev/null || continue
+    [[ $v -gt 0 ]] && echo "$p"
+  done
+  return 0
+}
+
+touch_status() {
+  local devs any_off=0
+  devs="$(touch_devices)"
+  [[ -n $devs ]] || { echo none; return; }
+  for p in $devs; do
+    [[ $(< "$p/inhibited") == 1 ]] && any_off=1
+  done
+  [[ $any_off -eq 1 ]] && echo off || echo on
+}
+
+cmd_inhibit() {
+  local want="${1:-}"
+  case "$want" in on|off) ;; *) echo "usage: surfbook-sys inhibit <on|off>" >&2; exit 1 ;; esac
+
+  local devs
+  devs="$(touch_devices)"
+  if [[ -z $devs ]]; then
+    echo "no direct-input (touch) devices found"
+    return 2
+  fi
+
+  local v=0
+  [[ $want == on ]] && v=1
+  for p in $devs; do
+    echo "$v" > "$p/inhibited" 2>/dev/null || echo "  ! $p" >&2
+  done
+  mkdir -p /etc/surfacebook
+  if [[ $v -eq 1 ]]; then touch /etc/surfacebook/touch.inhibited; else rm -f /etc/surfacebook/touch.inhibited; fi
+  echo "touch devices $want ($(touch_status))"
+}
+
+# ---- gpu --------------------------------------------------------------------
+
+nvidia_slot() {
+  local slot
+  slot="$(sed -n 's/^gpu.slot[[:space:]]*=[[:space:]]*//p' /etc/surfacebook/tablet.conf 2>/dev/null | tail -n 1)"
+  slot="${slot%\"}"; slot="${slot#\"}"; slot="${slot%\'}"; slot="${slot#\'}"
+  case "$slot" in [0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F].[0-9a-fA-F].[0-9a-fA-F]) echo "$slot";; *) echo 0000:01:00.0;; esac
+}
+
+cmd_gpu() {
+  local action="${1:-}"
+  case "$action" in prepare|resume) ;; *) echo "usage: surfbook-sys gpu <prepare|resume>" >&2; exit 1 ;; esac
+
+  if [[ $(sed -n 's/^gpu.remove_on_detach[[:space:]]*=[[:space:]]*//p' /etc/surfacebook/tablet.conf 2>/dev/null | tail) != 1 ]]; then
+    echo "gpu.remove_on_detach is not 1; nothing to do"
+    return 0
+  fi
+
+  local slot
+  slot="$(nvidia_slot)"
+
+  if [[ $action == prepare ]]; then
+    if [[ -e /sys/bus/pci/devices/$slot/remove ]]; then
+      echo 1 > "/sys/bus/pci/devices/$slot/remove" && echo "removed $slot" || echo "failed to remove $slot" >&2
+    else
+      echo "$slot already gone"
+    fi
+  else
+    if [[ -d /sys/bus/pci/devices/$slot ]]; then
+      echo "$slot already present"
+    else
+      echo 1 > /sys/bus/pci/rescan && echo "rescanned for $slot" || echo "rescan failed" >&2
+    fi
+  fi
+}
+
+# ---- dispatch --------------------------------------------------------------
+
+case "${1:-}" in
+  install-root)   require_root install-root; shift; install_root "$@" ;;
+  uninstall-root) require_root uninstall-root; uninstall_root ;;
+  touch-status)   touch_status ;;
+  inhibit)        require_root inhibit; shift; cmd_inhibit "${1:-}" ;;
+  gpu)            require_root gpu; shift; cmd_gpu "${1:-}" ;;
+  hwtab-check)    [[ -c /dev/surface/dtx ]] && echo ok ;;
+  *) echo "usage: surfbook-sys {install-root|uninstall-root|touch-status|inhibit|gpu|hwtab-check}" >&2; exit 1 ;;
+esac

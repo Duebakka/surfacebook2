@@ -1,0 +1,16 @@
+[Unit]
+Description=Surface Book 2 tablet-mode watchdog
+Documentation=https://github.com/duebakka/surfacebook2
+# The widget and rotation depend on the omarchy shell, but the service itself
+# only needs the system bus, so it starts with the desktop session.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/surfacebook/bin/surfbookd run
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=Surface Book 2 on-screen keyboard (wvkbd)
+Documentation=https://github.com/duebakka/surfacebook2
+# wvkbd is a Wayland/input-method client, so it must run inside the graphical
+# session with WAYLAND_DISPLAY and the user bus. Surfbookd (the tablet-mode
+# watchdog) starts this in tablet mode and stops it when the base re-attaches.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# --auto: show the keyboard whenever a text field gains focus (zwp_input_method_v2).
+#         It hides again when focus goes away, so this is safe to keep running
+#         while the base is detached.
+ExecStart=/usr/bin/wvkbd-mobintl --auto --hidden
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

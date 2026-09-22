@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "dues.surfacebook2",
+  "name": "Surface Book 2 Tablet & OSK",
+  "version": "0.1.0",
+  "author": "DueBakka",
+  "description": "Surface Book 2 base eject, tablet-mode auto-crossover, touchscreen toggle, and a split two-thumb on-screen keyboard.",
+  "kinds": [
+    "bar-widget",
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "overlay": "Keyboard.qml"
+  },
+  "barWidget": {
+    "displayName": "Surface Book 2 Tablet & OSK",
+    "description": "Eject the base, auto-switch to tablet mode, and toggle the touchscreen",
+    "category": "Hardware",
+    "allowMultiple": false
+  }
+}
