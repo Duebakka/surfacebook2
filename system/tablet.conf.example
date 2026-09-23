@@ -35,16 +35,20 @@ transform_right=1
 
 # Orientation sensor tuning (Surface clipboard HID accelerometer).
 # Threshold (m/s^2) above which a sensor axis counts as "down"; debounce is
-# the number of consecutive polls a new orientation must hold before applying.
+# the number of SECONDS a new orientation must be held continuously before
+# the display rotates (fractional values fine - catches grip wobble without
+# making deliberate turns feel laggy).
 sensor_threshold=5.0
-sensor_debounce=2
+sensor_debounce=0.8
 
 # Optional scale per mode (leave empty to keep the current one).
 scale_laptop=
 scale_tablet=
 
-# Watchdog poll interval in seconds.
-poll_interval=2
+# Watchdog poll interval in seconds (fractional allowed).
+# The transform is applied at most one poll cycle after the debounce elapses,
+# so 0.5s keeps rotation responsive; raise it if you want quieter polling.
+poll_interval=0.5
 
 # On-screen keyboard (wvkbd) behavior when the clipboard detaches into tablet
 # mode. Values: auto (keyboard raises while detached into tablet mode - the

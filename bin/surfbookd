@@ -12,6 +12,11 @@
 # keyboard_status; the overlay injects keystrokes itself via ydotool).
 # surfbookctl keyboard on/off overrides the automatic behavior.
 #
+# Rotation latency follows the poll cadence plus a short, wall-clock debounce:
+# a new orientation must be seen continuously for sensor_debounce seconds
+# (default 0.8s) before the display moves, so brief grip wobble doesn't flip
+# the screen while a deliberate turn still lands within about a second.
+#
 # Run via surfacebook-watchdog.service (or from a terminal: surfbookd run).
 set -euo pipefail
 
@@ -49,8 +54,8 @@ declare -A CFG=(
   [scale_laptop]=
   [scale_tablet]=
   [sensor_threshold]=5.0
-  [sensor_debounce]=2
-  [poll_interval]=2
+  [sensor_debounce]=0.8
+  [poll_interval]=0.5
   [keyboard_mode]=auto
 )
 
@@ -198,6 +203,10 @@ absf() { awk -v v="$1" 'BEGIN { printf "%.4f", (v < 0 ? -v : v) }'; }
 
 gtf() { awk -v a="$1" -v b="$2" 'BEGIN { printf (a > b) ? "1" : "0" }'; }
 
+# Monotonic milliseconds since boot. The debounce clock needs sub-second
+# resolution (poll_interval is fractional), so uptime beats wall-clock time.
+now_ms() { awk '{ print int($1 * 1000) }' /proc/uptime; }
+
 # Climbed edge of the screen, from gravity: one of top-up, bottom-up, left-up,
 # right-up, or flat (held near-level / no sensor) — empty means unavailable.
 edge() {
@@ -339,17 +348,16 @@ run() {
   single_instance
   load_config
   local sleep_sec="$(cfg poll_interval)"
-  sleep_sec="$(echo "$sleep_sec" | tr -cd '0-9')"
-  [[ -n $sleep_sec && $sleep_sec -ge 1 && $sleep_sec -le 30 ]] || sleep_sec=2
+  sleep_sec="$(awk -v v="$sleep_sec" 'BEGIN { if (v==v+0 && v>=0.1 && v<=30) printf "%.3f", v; else print 0.5 }')"
   local debounce="$(cfg sensor_debounce)"
-  debounce="$(echo "$debounce" | tr -cd '0-9')"
-  [[ -n $debounce && $debounce -ge 1 && $debounce -le 10 ]] || debounce=2
-  log "surfbookd starting (poll ${sleep_sec}s, sensor debounce ${debounce}x)"
+  debounce="$(awk -v v="$debounce" 'BEGIN { if (v==v+0 && v>=0 && v<=5) printf "%.3f", v; else print 0.8 }')"
+  local debounce_ms="$(awk -v s="$debounce" 'BEGIN { m=int(s*1000+0.5); print m>0?m:1 }')"
+  local idle_goal="$(awk -v s="$sleep_sec" 'BEGIN { n=int(30/s+0.5); print n>0?n:1 }')"
+  log "surfbookd starting (poll ${sleep_sec}s, sensor debounce ${debounce}s)"
   write_state unknown unknown unknown 0
 
   local prev_m="" prev_ba="" prev_desk=0
-  local prev_edge="" pending_edge="" applied_edge=""
-  local confirm=0
+  local prev_edge="" applied_edge="" first_seen_ms=""
   local idle=0
 
   while :; do
@@ -372,39 +380,39 @@ run() {
       write_state "$m" "$la" "$ba" "$desk"
       prev_m="$m"; prev_ba="$ba"; prev_desk="$desk"
 
-      # Reset the grip tracker on mode changes to land the first edge read
-      # immediately (entry state rotates once, later changes debounce).
-      prev_edge="$(edge)"; pending_edge="$prev_edge"
-      applied_edge="$prev_edge"
-      confirm=0
+      # Reset the grip tracker on mode changes so the first edge read lands
+      # immediately (entry state rotates once; later turns debounce).
+      prev_edge="$(edge)"; applied_edge="$prev_edge"
+      first_seen_ms=""
       idle=0
     fi
 
-    # In tablet (auto) mode, keep chasing the held orientation with a small
-    # debounce so grip wobble doesn't flip the screen back and forth.
+    # In tablet (auto) mode keep chasing the held orientation, but only move the
+    # screen after the edge has been seen continuously for sensor_debounce
+    # seconds, so grip wobble doesn't flip the display back and forth.
     if [[ $m == tablet && $ba == detached && $(rotation_mode) == auto ]]; then
-      local e
+      local e now_uptime
       e="$(edge)"
       if [[ -n $e && $e != flat ]]; then
+        now_uptime="$(now_ms)"
         if [[ $e != "$prev_edge" ]]; then
-          prev_edge="$e"; pending_edge="$e"; confirm=1
-        elif [[ $confirm -lt $debounce ]]; then
-          confirm=$((confirm + 1))
+          prev_edge="$e"; first_seen_ms="$now_uptime"
         fi
-        if [[ $confirm -ge $debounce && $pending_edge != "$applied_edge" ]]; then
-          rotate tablet "$(transform_for_edge "$pending_edge")"
-          applied_edge="$pending_edge"
+        if [[ -n $first_seen_ms && $now_uptime -ge $((first_seen_ms + debounce_ms)) \
+              && $e != "$applied_edge" ]]; then
+          rotate tablet "$(transform_for_edge "$e")"
+          applied_edge="$e"
           write_state "$m" "$la" "$ba" "$desk"
         fi
       fi
     elif [[ $m != "unknown" ]]; then
-      prev_edge=""; pending_edge=""; applied_edge=""; confirm=0
+      prev_edge=""; applied_edge=""; first_seen_ms=""
     fi
 
     sleep "$sleep_sec"
     idle=$((idle + 1))
     # Re-publish every ~30s so the widget stays honest across restarts.
-    if [[ $idle -ge $((30 / sleep_sec)) ]]; then
+    if [[ $idle -ge $idle_goal ]]; then
       write_state "$m" "$la" "$ba" "$desk"
       idle=0
     fi

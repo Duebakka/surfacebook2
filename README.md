@@ -104,7 +104,11 @@ In tablet mode the display turns to match how you hold the clipboard: hold it
 like a book and it goes to `transform_top` (portrait), turn it sideways and it
 switches to `transform_left`/`transform_right` (landscape). The reading comes
 from the clipboard's on-board HID accelerometer (`accel_3d`, an IIO device);
-grip changes are debounced (`sensor_debounce` polls) before the display moves.
+grip changes are debounced — a new orientation must hold for `sensor_debounce`
+seconds (default `0.8`) before the display moves, so wobble doesn't flip it but
+deliberate turns still land within about a second. The watchdog polls the
+sensor every `poll_interval` (default `0.5`), so the transform is applied at
+most one poll cycle after the debounce elapses.
 
 The **Auto rotate** toggle in the widget (or `surfbookctl rotation`) toggles
 between:
@@ -172,8 +176,8 @@ transform_bottom=2
 transform_left=1          # held sideways -> landscape
 transform_right=3
 sensor_threshold=5.0      # m/s^2 floor before an axis counts as "down"
-sensor_debounce=2         # polls a new orientation must hold before applying
-poll_interval=2
+sensor_debounce=0.8       # seconds a new orientation must hold before rotating
+poll_interval=0.5         # watchdog poll cadence in seconds (fractional)
 
 gpu.remove_on_detach=0
 gpu.slot=0000:01:00.0
