@@ -231,7 +231,9 @@ protocol-mode handover (`Failed to set memory window: -11`, then
 where the touch sensor won't respond until a full reboot. With the daemon
 masked, event mode survives a reboot and touch just works as a normal evdev
 device (`event10`, Hyprland-registered). If `iptsd@.service` is unmasked, a
-reboot is required to recover the sensor.
+reboot is required to recover the sensor. When auto-rotating, the watchdog
+keeps Hyprland's touch-device transform in lockstep with the display, so taps
+land where you are touching in every held orientation.
 
 ## Troubleshooting
 

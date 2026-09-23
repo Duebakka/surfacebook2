@@ -257,6 +257,22 @@ current_transform() {
     'map(select(.name==$m))[0].transform // 1' 2>/dev/null || echo ""
 }
 
+# Name of the primary touchscreen as Hyprland sees it (empty when none).
+touch_device_name() {
+  command -v hyprctl >/dev/null 2>&1 || return 1
+  hyprctl devices -j 2>/dev/null | jq -er '.touch[0].name // empty' 2>/dev/null || echo ""
+}
+
+# Hyprland does not rotate touch input on its own: the display transform and
+# the touchscreen's input transform must be kept in lockstep, or the screen
+# turns while taps land where they would have in the old orientation.
+touch_transform() {
+  local tr="$1" name
+  name="$(touch_device_name)"
+  [[ -n $name ]] || return 0
+  hyprctl eval "hl.device({ name = \"$name\", transform = $tr })" >/dev/null 2>&1 || true
+}
+
 # rotate <mode> [explicit transform]. mode is laptop|tablet; the transform is
 # `transform_laptop`/`transform_tablet` for the mode, or the explicit one
 # (used for edge autotrotation).
@@ -283,6 +299,7 @@ rotate() {
       hyprctl eval "hl.monitor({ $spec })" >/dev/null 2>&1 || true
       sleep 0.4
     fi
+    touch_transform "$tr"
   fi
   log "rotated ${want} -> transform $tr${scale:+ scale $scale}"
 }
