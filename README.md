@@ -202,9 +202,17 @@ firmware does the touch processing and the kernel exposes a real
 `IPTS 045E:0021 Touchscreen` input device. Install just the module:
 
 ```sh
-# 1. kernel module (DKMS), built against the running omarchy kernel:
+# 1. kernel module (DKMS), built against the running omarchy kernel.
+#    Pinned to a known-good commit and verified before any privileged
+#    dkms step, so a later upstream change (or a compromised upstream
+#    repo) can't silently alter what root loads into the kernel:
+ipts_commit=3b88a45360b4fdab85e2d4389fb4812f5867c1b7
 git clone https://github.com/linux-surface/intel-precise-touch /tmp/ipts
-cd /tmp/ipts && sudo dkms add . && sudo dkms install --force ipts/1.0.0
+git -C /tmp/ipts checkout --detach "$ipts_commit" || exit 1
+[ "$(git -C /tmp/ipts rev-parse HEAD)" = "$ipts_commit" ] \
+  || { echo "ipts checkout verification failed; aborting" >&2; exit 1; }
+sudo dkms add /tmp/ipts
+sudo dkms install --force ipts/1.0.0
 
 # 2. autoload at boot:
 echo ipts | sudo tee /etc/modules-load.d/ipts.conf
